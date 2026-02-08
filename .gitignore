@@ -1,3 +1,8 @@
+node_modules/
+.DS_Store
+*.log
+
+# Legacy Python artifacts
 __pycache__/
 *.pyc
 *.pyo
@@ -7,7 +12,7 @@ venv/
 dist/
 build/
 uv.lock
-.DS_Store
-
-# Test scripts (not part of the package)
 test_*.py
+
+# Old Node.js dev copy
+fast-context-mcp-node/
