@@ -169,9 +169,7 @@ export function extractStrings(data) {
         const raw = data.subarray(i, i + length);
         try {
           const text = raw.toString("utf-8");
-          // Verify it's valid UTF-8 by checking for replacement chars
-          // that shouldn't be there
-          if (text.length > 5 && !text.includes("\ufffd")) {
+          if (text.length > 5) {
             strings.push(text);
           }
         } catch {

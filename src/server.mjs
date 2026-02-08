@@ -22,6 +22,7 @@ import { searchWithContent, extractKeyInfo } from "./core.mjs";
 // Read config from environment
 const MAX_TURNS = parseInt(process.env.FC_MAX_TURNS || "3", 10);
 const MAX_COMMANDS = parseInt(process.env.FC_MAX_COMMANDS || "8", 10);
+const TIMEOUT_MS = parseInt(process.env.FC_TIMEOUT_MS || "30000", 10);
 
 const server = new McpServer({
   name: "windsurf-fast-context",
@@ -64,6 +65,7 @@ server.tool(
         projectRoot: projectPath,
         maxTurns: MAX_TURNS,
         maxCommands: MAX_COMMANDS,
+        timeoutMs: TIMEOUT_MS,
       });
       return { content: [{ type: "text", text: result }] };
     } catch (e) {

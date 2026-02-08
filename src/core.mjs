@@ -318,6 +318,18 @@ function getApiKey() {
   );
 }
 
+// ─── TLS Fallback ──────────────────────────────────────────
+// Match Python's SSL fallback: if NODE_TLS_REJECT_UNAUTHORIZED is not set
+// and the first fetch fails with a TLS error, disable cert verification.
+let _tlsFallbackApplied = false;
+
+function _applyTlsFallback() {
+  if (!_tlsFallbackApplied && !process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+    _tlsFallbackApplied = true;
+  }
+}
+
 // ─── Network Layer ─────────────────────────────────────────
 
 /**
@@ -343,12 +355,21 @@ async function _unaryRequest(url, protoBytes, compress = true) {
     body = protoBytes;
   }
 
-  const resp = await fetch(url, {
+  const doFetch = () => fetch(url, {
     method: "POST",
     headers,
     body,
     signal: AbortSignal.timeout(30000),
   });
+
+  let resp;
+  try {
+    resp = await doFetch();
+  } catch (e) {
+    // TLS or network error — try with cert verification disabled
+    _applyTlsFallback();
+    resp = await doFetch();
+  }
 
   if (!resp.ok) {
     const err = new Error(`HTTP ${resp.status}`);
@@ -357,17 +378,16 @@ async function _unaryRequest(url, protoBytes, compress = true) {
   }
 
   const arrayBuf = await resp.arrayBuffer();
-  // Node.js fetch auto-decompresses gzip, no manual gunzip needed
   return Buffer.from(arrayBuf);
 }
 
 /**
  * Connect-RPC streaming POST to GetDevstralStream.
  * @param {Buffer} protoBytes
- * @param {number} [timeoutMs=5999]
+ * @param {number} [timeoutMs=30000]
  * @returns {Promise<Buffer>}
  */
-async function _streamingRequest(protoBytes, timeoutMs = 5999) {
+async function _streamingRequest(protoBytes, timeoutMs = 30000) {
   const frame = connectFrameEncode(protoBytes);
   const url = `${API_BASE}/GetDevstralStream`;
   const traceId = randomUUID().replace(/-/g, "");
@@ -388,12 +408,20 @@ async function _streamingRequest(protoBytes, timeoutMs = 5999) {
     "Sentry-Trace": `${traceId}-${spanId}-0`,
   };
 
-  const resp = await fetch(url, {
+  const doFetch = () => fetch(url, {
     method: "POST",
     headers,
     body: frame,
     signal: AbortSignal.timeout(120000),
   });
+
+  let resp;
+  try {
+    resp = await doFetch();
+  } catch (e) {
+    _applyTlsFallback();
+    resp = await doFetch();
+  }
 
   if (!resp.ok) {
     const err = new Error(`HTTP ${resp.status}`);
@@ -561,6 +589,16 @@ function _buildRequest(apiKey, jwt, messages, toolDefs) {
 // ─── Response Parsing ──────────────────────────────────────
 
 /**
+ * Strip invalid UTF-8 bytes from a Buffer → clean string.
+ * Matches Python's bytes.decode("utf-8", errors="ignore").
+ * @param {Buffer} buf
+ * @returns {string}
+ */
+function stripInvalidUtf8(buf) {
+  return buf.toString("utf-8").replace(/\ufffd/g, "");
+}
+
+/**
  * Parse tool call from [TOOL_CALLS]name[ARGS]{json} format.
  * @param {string} text
  * @returns {[string, string, Object]|null} [thinking, name, args] or null
@@ -624,8 +662,8 @@ function _parseResponse(data) {
       // Not JSON, continue
     }
 
-    // Extract text from frame
-    const rawText = frameData.toString("utf-8");
+    // Extract text from frame — strip invalid UTF-8 (matches Python errors="ignore")
+    const rawText = stripInvalidUtf8(frameData);
     if (rawText.includes("[TOOL_CALLS]")) {
       allText = rawText;
       break;
@@ -708,6 +746,7 @@ function _parseAnswer(xmlText, projectRoot) {
  * @param {string} [opts.jwt] - JWT token (auto-fetched if not set)
  * @param {number} [opts.maxTurns=3] - Search rounds
  * @param {number} [opts.maxCommands=8] - Max commands per round
+ * @param {number} [opts.timeoutMs=30000] - Connect-Timeout-Ms for streaming requests
  * @param {function} [opts.onProgress] - Progress callback
  * @returns {Promise<Object>}
  */
@@ -718,6 +757,7 @@ export async function search({
   jwt = null,
   maxTurns = 3,
   maxCommands = 8,
+  timeoutMs = 30000,
   onProgress = null,
 }) {
   const log = (msg) => onProgress?.(msg);
@@ -759,7 +799,7 @@ export async function search({
     const proto = _buildRequest(apiKey, jwt, messages, toolDefs);
     let respData;
     try {
-      respData = await _streamingRequest(proto);
+      respData = await _streamingRequest(proto, timeoutMs);
     } catch (e) {
       return { files: [], error: `Request failed: ${e.message}` };
     }
@@ -825,6 +865,7 @@ export async function search({
  * @param {string} [opts.apiKey]
  * @param {number} [opts.maxTurns=3]
  * @param {number} [opts.maxCommands=8]
+ * @param {number} [opts.timeoutMs=30000]
  * @returns {Promise<string>}
  */
 export async function searchWithContent({
@@ -833,8 +874,9 @@ export async function searchWithContent({
   apiKey = null,
   maxTurns = 3,
   maxCommands = 8,
+  timeoutMs = 30000,
 }) {
-  const result = await search({ query, projectRoot, apiKey, maxTurns, maxCommands });
+  const result = await search({ query, projectRoot, apiKey, maxTurns, maxCommands, timeoutMs });
 
   if (result.error) {
     return `Error: ${result.error}`;
