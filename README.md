@@ -106,6 +106,15 @@ Add to `claude_desktop_config.json` under `mcpServers`:
 | `WINDSURF_API_KEY` | *(auto-discover)* | Windsurf API key |
 | `FC_MAX_TURNS` | `3` | Search rounds per query (more = deeper but slower) |
 | `FC_MAX_COMMANDS` | `8` | Max parallel commands per round |
+| `FC_TIMEOUT_MS` | `30000` | Connect-Timeout-Ms for streaming requests |
+
+## Available Models
+
+The model can be changed by editing `WS_MODEL` in `src/core.mjs:37`.
+
+![Available Models](docs/models.png)
+
+Default: `MODEL_SWE_1_6_FAST` — fastest speed, richest grep keywords, finest location granularity.
 
 ## MCP Tools
 
@@ -124,14 +133,13 @@ Returns:
 
 Example output:
 ```
-Found 3 relevant files. IMPORTANT: You MUST examine ALL 3 files below.
+Found 3 relevant files.
 
   [1/3] /project/src/auth/handler.py (L10-60, L120-180)
   [2/3] /project/src/middleware/jwt.py (L1-40)
   [3/3] /project/src/models/user.py (L20-80)
 
-Suggested search keywords:
-  authenticate, jwt.*verify, session.*token
+grep keywords: authenticate, jwt.*verify, session.*token
 ```
 
 ### `extract_windsurf_key`
@@ -166,7 +174,7 @@ fast-context-mcp/
 ## Technical Details
 
 - **Protocol**: Connect-RPC over HTTP/1.1, Protobuf encoding, gzip compression
-- **Model**: Devstral (`MODEL_SWE_1_5_SLOW`)
+- **Model**: Devstral (`MODEL_SWE_1_6_FAST`, configurable)
 - **Local tools**: `rg` (bundled), `readfile`, `tree`, `ls`, `glob`
 - **Auth**: API Key → JWT (auto-fetched per session)
 - **Runtime**: Node.js >= 18 (ESM)
