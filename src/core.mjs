@@ -26,6 +26,7 @@ import {
 } from "./protobuf.mjs";
 import { ToolExecutor } from "./executor.mjs";
 import { extractKey } from "./extract-key.mjs";
+import { parseToolCallRobust } from "./json-repair.mjs";
 
 // ─── Protocol Constants ────────────────────────────────────
 
@@ -80,6 +81,14 @@ directory, not \`.
   - tree: Display directory structure as a tree
     - Required: path (string)
     - Optional: levels (int)
+  - glob: Find files matching a glob pattern
+    - Required: pattern (string), path (string)
+    - Optional: type_filter (string: "file", "directory", "all")
+  - ls: List files in a directory
+    - Required: path (string)
+    - Optional: long_format (bool), all (bool)
+- Use \`glob\` to discover files by pattern (e.g. \`**/*.py\`, \`**/go.mod\`) \
+and \`ls\` to quickly confirm module contents.
 
 # THINKING RULES
 - Think step-by-step. Plan, reason, and reflect before each tool call.
@@ -89,19 +98,39 @@ in real code, not assumptions.
 complain to the user.
 
 # FAST-SEARCH DEFAULTS (optimize rg/tree on large repos)
-- Start NARROW, then widen only if needed. Prefer searching likely code \
-roots first (e.g., \`src/\`, \`lib/\`, \`app/\`, \`packages/\`, \`services/\`) \
-instead of \`/codebase\`.
+- "Repo-map driven": ALWAYS study the provided Repo Map BEFORE searching. \
+Derive candidate search roots from ACTUAL directory names in the map. \
+Do NOT assume standard names like \`src/\`, \`lib/\`, \`app/\` — treat ALL \
+top-level directories as potential code roots.
+- "Directory-name matching (CRITICAL)": Scan the Repo Map for directory \
+names that semantically match the query. If the query mentions \
+"register" and a directory is named \`auto-register/\`, you MUST search \
+it. If the query mentions "proxy" and a directory is named \`warp-proxy/\`, \
+you MUST search it. Directory names are strong signals — never skip a \
+directory whose name overlaps with query keywords.
+- "Zero-hit escalation (CRITICAL)": When \`rg\` in a semantically-matching \
+directory returns zero results, do NOT abandon it. The code may use \
+different terminology, synonyms, or a non-English language. Instead, \
+ESCALATE: use \`ls\` to list the directory, then \`readfile\` the most \
+likely entry-point files (e.g. the largest .py/.go/.ts file, or files \
+whose names relate to the query). A matching directory name is STRONGER \
+evidence than a failed grep — always explore it further.
+- "Infer languages/modules": Look for build/manifest files \
+(\`package.json\`, \`go.mod\`, \`pyproject.toml\`, \`Cargo.toml\`, \`pom.xml\`) \
+in the repo map to identify modules and choose appropriate \`include\` globs.
+- "Parallel fan-out (anti-tunnel)": In each turn, distribute \`rg\` across \
+2–4 DIFFERENT candidate roots/modules. Avoid spending more than 2 \
+commands in the same subdirectory unless you already have strong hits.
+- "Constrained broad search": In turn 1, include at least 1 repo-wide \
+\`rg\` at \`/codebase\` constrained by language-specific \`include\` globs \
+and the default excludes. This catches files in unexpected locations.
 - Prefer fixed-string search for literals: escape patterns or keep regex \
 simple. Use smart case; avoid case-insensitive unless necessary.
-- Prefer file-type filters and globs (in include) over full-repo scans.
 - Default EXCLUDES for speed (apply via the exclude array): \
 node_modules, .git, dist, build, coverage, .venv, venv, target, out, \
 .cache, __pycache__, vendor, deps, third_party, logs, data, *.min.*
 - Skip huge files where possible; when opening files, prefer reading \
 only relevant ranges with readfile.
-- Limit directory traversal with tree levels to quickly orient before \
-deeper inspection.
 
 # SOME EXAMPLES OF WORKFLOWS
 - MAP – Use \`tree\` with small levels; \`rg\` on likely roots to grasp \
@@ -145,6 +174,11 @@ tools, so issuing multiple commands at once is necessary and encouraged \
 to speed up your research.
 - Each command result may be truncated to 50 lines; prefer multiple \
 targeted reads/searches to build complete context.
+- "Command budget": Aim to use 6–{max_commands} commands per turn unless you \
+are already confident. Typical allocation per turn:
+  - 1 orientation (\`tree\`/\`ls\`/\`glob\` when needed)
+  - 3–5 \`rg\` across DIFFERENT roots or language scopes
+  - 1–2 \`readfile\` for the best hits (entire semantic blocks)
 - DO NOT EVER USE MORE THAN {max_commands} commands in a single turn, or you will \
 be penalized.
 
@@ -168,10 +202,13 @@ Output example inside the "answer" tool argument:
 </ANSWER>
 
 
-Remember: Prefer narrow, fixed-string, and type-filtered searches with \
-aggressive excludes and size/depth limits. Widen scope only as needed. \
-Use the restricted tools available to you, and output your answer in \
-exactly the specified format.
+Remember: Read the Repo Map to identify ALL relevant directories — do \
+not skip directories just because they have nonstandard names. Fan out \
+searches across multiple roots in each turn. If a directory name matches \
+the query but rg returns nothing, USE ls + readfile to explore it anyway \
+(the code may use different terms or a non-English language). Use \
+language-specific include globs and aggressive excludes for precision. \
+Output your answer in exactly the specified format.
 `;
 
 const FINAL_FORCE_ANSWER =
@@ -593,41 +630,12 @@ function stripInvalidUtf8(buf) {
 
 /**
  * Parse tool call from [TOOL_CALLS]name[ARGS]{json} format.
+ * Uses robust JSON repair to handle malformed model output.
  * @param {string} text
  * @returns {[string, string, Object]|null} [thinking, name, args] or null
  */
 function _parseToolCall(text) {
-  text = text.replace(/<\/s>/g, "");
-  const m = text.match(/\[TOOL_CALLS\](\w+)\[ARGS\](\{.+)/s);
-  if (!m) return null;
-
-  const name = m[1];
-  const raw = m[2].trim();
-
-  // Find matching closing brace
-  let depth = 0;
-  let end = 0;
-  for (let i = 0; i < raw.length; i++) {
-    if (raw[i] === "{") depth++;
-    else if (raw[i] === "}") {
-      depth--;
-      if (depth === 0) {
-        end = i + 1;
-        break;
-      }
-    }
-  }
-  if (end === 0) end = raw.length;
-
-  let args;
-  try {
-    args = JSON.parse(raw.slice(0, end));
-  } catch {
-    return null;
-  }
-
-  const thinking = text.slice(0, m.index).trim();
-  return [thinking, name, args];
+  return parseToolCallRobust(text);
 }
 
 /**
@@ -693,13 +701,85 @@ const MAX_TREE_BYTES = 250 * 1024;
  * @param {number} [targetDepth=3] - Desired tree depth (1-6)
  * @returns {{ tree: string, depth: number, sizeBytes: number, fellBack: boolean }}
  */
+// Noise patterns to exclude from repo map tree — these directories/files
+// clutter the tree without providing useful structural information.
+const TREE_EXCLUDE_PATTERNS = [
+  /__pycache__/,
+  /\.pyc/,
+  /node_modules/,
+  /\.venv/,
+  /\.git/,
+  /\.cache/,
+  /\.tox/,
+  /\.mypy_cache/,
+  /\.pytest_cache/,
+  /\.next/,
+  /\.nuxt/,
+  /\.DS_Store/,
+  /Thumbs\.db/,
+  /\.egg-info/,
+];
+
+/**
+ * Extract top-level directory names from a tree string.
+ * @param {string} treeStr - Output of tree-node-cli
+ * @returns {string[]}
+ */
+function extractTopDirs(treeStr) {
+  const dirs = [];
+  for (const line of treeStr.split("\n")) {
+    // tree-node-cli uses ├── or └── for entries; top-level entries are depth-1
+    const m = line.match(/^[├└]── (.+)/);
+    if (m) {
+      const name = m[1].replace(/\/$/, "");
+      dirs.push(name);
+    }
+  }
+  return dirs;
+}
+
+/**
+ * Find directories in the repo map whose names semantically overlap
+ * with query keywords. Used to inject priority hints into user message
+ * so the model doesn't skip relevant directories after grep misses.
+ *
+ * @param {string} query - User's search query
+ * @param {string} treeStr - Repo map tree string
+ * @returns {string[]} - Matching directory names
+ */
+function findPriorityDirs(query, treeStr) {
+  const topDirs = extractTopDirs(treeStr);
+  // Tokenize query into keywords (>=3 chars, lowercased, deduplicated)
+  const queryTokens = [...new Set(
+    query.toLowerCase()
+      .replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ")
+      .split(/\s+/)
+      .filter(t => t.length >= 3)
+  )];
+
+  const matches = [];
+  for (const dir of topDirs) {
+    const dirLower = dir.toLowerCase();
+    // Split dir name on common separators (-, _, .)
+    const dirTokens = dirLower.split(/[-_./]+/).filter(t => t.length >= 2);
+    // Check if any query token is a substring of the dir name,
+    // or any dir token is a substring of a query token
+    const hit = queryTokens.some(qt =>
+      dirLower.includes(qt) ||
+      dirTokens.some(dt => qt.includes(dt) || dt.includes(qt))
+    );
+    if (hit) matches.push(dir);
+  }
+  return matches;
+}
+
 function getRepoMap(projectRoot, targetDepth = 3) {
   const rootPattern = new RegExp(projectRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
   const dirName = projectRoot.split("/").pop() || projectRoot.split("\\").pop() || projectRoot;
 
   for (let L = targetDepth; L >= 1; L--) {
     try {
-      const stdout = treeNodeCli(projectRoot, { maxDepth: L });
+      const stdout = treeNodeCli(projectRoot, { maxDepth: L, exclude: TREE_EXCLUDE_PATTERNS });
       // tree-node-cli outputs basename as root line; replace with /codebase
       let treeStr = stdout.replace(rootPattern, "/codebase");
       // Also replace the basename root line (first line) if full path wasn't matched
@@ -807,7 +887,16 @@ export async function search({
 
   const { tree: repoMap, depth: actualDepth, sizeBytes: treeSizeBytes, fellBack } = getRepoMap(projectRoot, treeDepth);
   log(`Repo map: tree -L ${actualDepth} (${(treeSizeBytes / 1024).toFixed(1)}KB)${fellBack ? ` [fell back from L=${treeDepth}]` : ""}`);
-  const userContent = `Problem Statement: ${query}\n\nRepo Map (tree -L ${actualDepth} /codebase):\n\`\`\`text\n${repoMap}\n\`\`\``;
+
+  // Auto-detect priority directories from query keywords vs repo map
+  const priorityDirs = findPriorityDirs(query, repoMap);
+  let priorityHint = "";
+  if (priorityDirs.length > 0) {
+    log(`Priority directories detected: ${priorityDirs.join(", ")}`);
+    priorityHint = `\n\nPriority Directories (names match query keywords — MUST explore with ls + readfile even if rg finds nothing):\n${priorityDirs.map(d => `- /codebase/${d}/`).join("\n")}`;
+  }
+
+  const userContent = `Problem Statement: ${query}\n\nRepo Map (tree -L ${actualDepth} /codebase):\n\`\`\`text\n${repoMap}\n\`\`\`${priorityHint}`;
 
   const messages = [
     { role: 5, content: systemPrompt },
@@ -854,6 +943,18 @@ export async function search({
 
       const cmds = Object.keys(toolArgs).filter((k) => k.startsWith("command"));
       log(`Executing ${cmds.length} local commands`);
+      for (const k of cmds) {
+        const c = toolArgs[k];
+        if (c && typeof c === "object") {
+          const t = c.type || "?";
+          const detail = t === "rg" ? `pattern=${c.pattern} path=${c.path}` :
+                         t === "readfile" ? `file=${c.file}` :
+                         t === "tree" ? `path=${c.path}` :
+                         t === "glob" ? `pattern=${c.pattern} path=${c.path}` :
+                         t === "ls" ? `path=${c.path}` : JSON.stringify(c);
+          log(`  ${k}: ${t} → ${detail}`);
+        }
+      }
 
       const results = executor.execToolCall(toolArgs);
 
@@ -904,7 +1005,8 @@ export async function searchWithContent({
   treeDepth = 3,
   timeoutMs = 30000,
 }) {
-  const result = await search({ query, projectRoot, apiKey, maxTurns, maxCommands, treeDepth, timeoutMs });
+  const debugLog = [];
+  const result = await search({ query, projectRoot, apiKey, maxTurns, maxCommands, treeDepth, timeoutMs, onProgress: (msg) => debugLog.push(msg) });
 
   if (result.error) {
     const meta = result._meta;
@@ -955,6 +1057,16 @@ export async function searchWithContent({
     const fbNote = meta.fellBack ? ` (fell back from requested depth)` : "";
     parts.push("");
     parts.push(`[config] tree_depth=${meta.treeDepth}${fbNote}, tree_size=${meta.treeSizeKB}KB, max_turns=${maxTurns}`);
+  }
+
+  // Append debug log showing what commands the model actually ran
+  if (debugLog.length) {
+    const cmdLines = debugLog.filter(l => l.startsWith("  command"));
+    if (cmdLines.length) {
+      parts.push("");
+      parts.push(`[debug] commands executed:`);
+      for (const line of cmdLines) parts.push(line);
+    }
   }
 
   return parts.join("\n");
