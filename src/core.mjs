@@ -994,6 +994,7 @@ export async function search({
  * @param {number} [opts.maxCommands=8]
  * @param {number} [opts.treeDepth=3]
  * @param {number} [opts.timeoutMs=30000]
+ * @param {boolean} [opts.debug=false] - Include executed commands in output
  * @returns {Promise<string>}
  */
 export async function searchWithContent({
@@ -1004,6 +1005,7 @@ export async function searchWithContent({
   maxCommands = 8,
   treeDepth = 3,
   timeoutMs = 30000,
+  debug = false,
 }) {
   const debugLog = [];
   const result = await search({ query, projectRoot, apiKey, maxTurns, maxCommands, treeDepth, timeoutMs, onProgress: (msg) => debugLog.push(msg) });
@@ -1059,8 +1061,7 @@ export async function searchWithContent({
     parts.push(`[config] tree_depth=${meta.treeDepth}${fbNote}, tree_size=${meta.treeSizeKB}KB, max_turns=${maxTurns}`);
   }
 
-  // Append debug log showing what commands the model actually ran
-  if (debugLog.length) {
+  if (debug && debugLog.length) {
     const cmdLines = debugLog.filter(l => l.startsWith("  command"));
     if (cmdLines.length) {
       parts.push("");

@@ -84,8 +84,12 @@ server.tool(
         "Default 3. Use 1 for quick simple lookups. Use 4-5 for complex queries requiring deep tracing across many files. " +
         "More rounds = better results but slower and uses more API quota."
       ),
+    debug: z
+      .boolean()
+      .default(false)
+      .describe("Include debug info (executed commands) in output. Default false."),
   },
-  async ({ query, project_path, tree_depth, max_turns }) => {
+  async ({ query, project_path, tree_depth, max_turns, debug }) => {
     let projectPath = project_path || process.cwd();
 
     try {
@@ -105,6 +109,7 @@ server.tool(
         maxCommands: MAX_COMMANDS,
         treeDepth: tree_depth,
         timeoutMs: TIMEOUT_MS,
+        debug,
       });
       return { content: [{ type: "text", text: result }] };
     } catch (e) {
